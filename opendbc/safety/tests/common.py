@@ -7,9 +7,10 @@ import numpy as np
 from collections.abc import Callable
 
 from opendbc.can import CANPacker
-from opendbc.safety import ALTERNATIVE_EXPERIENCE
+from opendbc.safety import ALTERNATIVE_EXPERIENCE, DLC_TO_LEN
 from opendbc.safety.tests.libsafety import libsafety_py
 from opendbc.car.lateral import MAX_LATERAL_ACCEL, MAX_LATERAL_JERK
+from opendbc.car.structs import CarParams
 
 from opendbc.safety.tests.mads_common import MadsSafetyTestBase
 
@@ -961,6 +962,8 @@ class SafetyTest(SafetyTestBase):
     current_test = self.__class__.__name__
 
     all_tx = []
+    shared_hyundai_display_modes = set()
+    hyundai_can_modes = {CarParams.SafetyModel.hyundai, CarParams.SafetyModel.hyundaiLegacy}
     for tf in test_files:
       test = importlib.import_module("opendbc.safety.tests."+tf[:-3])
       for attr in dir(test):
@@ -968,6 +971,11 @@ class SafetyTest(SafetyTestBase):
         if isinstance(tc, type) and issubclass(tc, SafetyTest) and attr != current_test:
           tx = tc.TX_MSGS
           if tx is not None and not attr.endswith('Base'):
+            if (self.DBC == tc.DBC == "hyundai_can_generated" and
+                self.SAFETY_MODEL in hyundai_can_modes and tc.SAFETY_MODEL in hyundai_can_modes and
+                [0x485, 0] in self.TX_MSGS and [0x485, 0] in tx):
+              shared_hyundai_display_modes.add(attr)
+
             # No point in comparing different Tesla safety modes
             if 'Tesla' in attr and 'Tesla' in current_test:
               continue
@@ -1036,7 +1044,28 @@ class SafetyTest(SafetyTestBase):
         # TODO: this should be blocked
         if current_test in ["TestNissanSafety", "TestNissanSafetyAltEpsBus", "TestNissanLeafSafety"] and [addr, bus] in self.TX_MSGS:
           continue
-        self.assertFalse(self._tx(msg), f"transmit of {addr=:#x} {bus=} from {test_name} during {current_test} was allowed")
+        if (addr, bus) == (0x485, 0) and test_name in shared_hyundai_display_modes:
+          # Hyundai CAN modes share this non-actuating HUD frame. The original
+          # port makes it 8 bytes; the old all-zero 8-byte probe only rejected
+          # the upstream 4-byte format. Verify the complete allowed schema
+          # instead of dropping this frame from cross-mode coverage.
+          hud_addr, hud_data, hud_bus = self.packer.make_can_msg("LFAHDA_MFC", 0, {"LFA_Icon_State": 2})
+          self.assertEqual((hud_addr, hud_bus, len(hud_data)), (0x485, 0, 8))
+          hud_msg = libsafety_py.make_CANPacket(hud_addr, hud_bus, hud_data)
+          self.assertTrue(self._tx(hud_msg))
+          for length in DLC_TO_LEN:
+            if length != 8:
+              self.assertFalse(self._tx(make_msg(0, 0x485, length)), f"LFAHDA_MFC accepted invalid {length=}")
+          for wrong_bus in (1, 2, 3):
+            self.assertFalse(self._tx(make_msg(wrong_bus, 0x485, 8)), f"LFAHDA_MFC accepted {wrong_bus=}")
+          relay_malfunction = self.safety.get_relay_malfunction()
+          try:
+            self.safety.set_relay_malfunction(True)
+            self.assertFalse(self._tx(hud_msg))
+          finally:
+            self.safety.set_relay_malfunction(relay_malfunction)
+        else:
+          self.assertFalse(self._tx(msg), f"transmit of {addr=:#x} {bus=} from {test_name} during {current_test} was allowed")
 
 
 @add_regen_tests
